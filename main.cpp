@@ -1,3 +1,5 @@
+#include "Tracy.hpp"
+
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
