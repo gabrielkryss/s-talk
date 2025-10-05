@@ -1,4 +1,5 @@
 #include "Tracy.hpp"
+#include "TracyLock.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -13,13 +14,18 @@
 #pragma comment(lib, "ws2_32.lib") // Link with WinSock library
 
 std::atomic<bool> running{true};
-std::mutex sendMutex, receiveMutex;
-std::condition_variable sendCV, receiveCV;
+TracyLockable(std ::mutex, sendMutex);
+TracyLockable(std ::mutex, receiveMutex);
+std::condition_variable_any sendCV, receiveCV;
 std::queue<std::string> sendQueue, receiveQueue;
 
 void inputThread(const std::string &userIp, unsigned short userPort) {
+  tracy::SetThreadName("Input Thread");
+  ZoneScopedN("Input Loop");
+
   std::string message;
   while (running) {
+    ZoneScopedN("getline");
     std::getline(std::cin, message);
     if (message == "!") {
       running = false;
@@ -28,8 +34,11 @@ void inputThread(const std::string &userIp, unsigned short userPort) {
       break;
     }
     {
-      std::lock_guard<std::mutex> lock(sendMutex);
+      ZoneScopedN("enqueue send");
+      std::lock_guard<LockableBase(std::mutex)> lock(sendMutex);
+      LockMark(sendMutex);
       sendQueue.push(message);
+      TracyPlot("SendQueueSize", int64_t(sendQueue.size()));
     }
 
     // Clear the line and print formatted message
@@ -42,12 +51,19 @@ void inputThread(const std::string &userIp, unsigned short userPort) {
 }
 
 void sendThread(SOCKET &sendSocket, sockaddr_in &remoteAddr) {
+  tracy::SetThreadName("Send Thread");
+  ZoneScopedN("Send Loop");
+
   while (running || !sendQueue.empty()) {
-    std::unique_lock<std::mutex> lock(sendMutex);
+    std::unique_lock<LockableBase(std::mutex)> lock(sendMutex);
+    ZoneScopedN("wait sendCV");
     sendCV.wait(lock, [] {
       return !sendQueue.empty() || !running;
     }); // Wait for new messages or termination
     if (!sendQueue.empty()) {
+      ZoneScopedN("sendto");
+      // snapshot size for plot while still holding lock (cheap)
+      TracyPlot("SendQueueSize", static_cast<int64_t>(sendQueue.size()));
       std::string message = sendQueue.front();
       sendQueue.pop();
       lock.unlock(); // Unlock mutex before sending data
@@ -58,19 +74,24 @@ void sendThread(SOCKET &sendSocket, sockaddr_in &remoteAddr) {
 }
 
 void receiveThread(SOCKET &recvSocket) {
+  tracy::SetThreadName("Receive Thread");
+  ZoneScopedN("Recv Loop");
+
   char buffer[2048];
   sockaddr_in senderAddr;
   int senderAddrLen = sizeof(senderAddr);
 
   while (running) {
+    ZoneScopedN("recvfrom");
     int bytesReceived =
         recvfrom(recvSocket, buffer, sizeof(buffer), 0,
                  reinterpret_cast<sockaddr *>(&senderAddr), &senderAddrLen);
     if (bytesReceived > 0) {
       {
-        std::lock_guard<std::mutex> lock(receiveMutex);
-        receiveQueue.push(
-            std::string(buffer, static_cast<size_t>(bytesReceived)));
+        std::lock_guard<LockableBase(std::mutex)> lock(receiveMutex);
+        LockMark(receiveMutex);
+        receiveQueue.emplace(buffer, static_cast<size_t>(bytesReceived));
+        TracyPlot("RecvQueueSize", int64_t(receiveQueue.size()));
       }
       receiveCV
           .notify_one(); // Notify display thread that a message is received
@@ -79,12 +100,18 @@ void receiveThread(SOCKET &recvSocket) {
 }
 
 void displayThread(const std::string &otherIp, unsigned short otherPort) {
+  tracy::SetThreadName("Display Thread");
+  ZoneScopedN("Display Loop");
+
   while (running || !receiveQueue.empty()) {
-    std::unique_lock<std::mutex> lock(receiveMutex);
+    std::unique_lock<LockableBase(std::mutex)> lock(receiveMutex);
+    ZoneScopedN("wait receiveCV");
     receiveCV.wait(lock, [] {
       return !receiveQueue.empty() || !running;
     }); // Wait for new messages or termination
     if (!receiveQueue.empty()) {
+      ZoneScopedN("print");
+      TracyPlot("RecvQueueSize", static_cast<int64_t>(receiveQueue.size()));
       std::string message = receiveQueue.front();
       receiveQueue.pop();
       lock.unlock(); // Unlock mutex while printing data
@@ -95,6 +122,9 @@ void displayThread(const std::string &otherIp, unsigned short otherPort) {
 }
 
 int main(int argc, char *argv[]) {
+  tracy::SetThreadName("Main Thread");
+  ZoneScoped;
+
   if (argc != 4) {
     std::cerr << "Usage: " << argv[0]
               << " <localhostIP> <instancePort> <otherInstancePort>"
